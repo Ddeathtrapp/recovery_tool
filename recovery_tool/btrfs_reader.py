@@ -1,0 +1,1388 @@
+"""Minimal BTRFS browser used by the Crostini recovery tool."""
+
+from __future__ import annotations
+
+import bisect
+import io
+import logging
+import stat
+import struct
+from collections import defaultdict, deque
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import BinaryIO, Dict, Iterable, Iterator, List, Optional, Tuple
+
+BLOCK_SIZE = 4096
+SUPERBLOCK_OFFSET = 0x10000
+SUPERBLOCK_SIZE = 4096
+SYS_CHUNK_ARRAY_OFFSET = 0x32B  # derived from the uapi struct layout
+
+BTRFS_INODE_ITEM_KEY = 1
+BTRFS_DIR_ITEM_KEY = 84
+BTRFS_DIR_INDEX_KEY = 96
+BTRFS_EXTENT_DATA_KEY = 108
+BTRFS_ROOT_ITEM_KEY = 132
+BTRFS_CHUNK_ITEM_KEY = 228
+
+BTRFS_FILE_EXTENT_INLINE = 0
+BTRFS_FILE_EXTENT_REG = 1
+BTRFS_FILE_EXTENT_PREALLOC = 2
+
+BTRFS_FT_UNKNOWN = 0
+BTRFS_FT_DIR = 2
+BTRFS_FT_SYMLINK = 7
+
+BTRFS_BLOCK_GROUP_DATA = 1 << 0
+BTRFS_BLOCK_GROUP_SYSTEM = 1 << 1
+BTRFS_BLOCK_GROUP_METADATA = 1 << 2
+BTRFS_BLOCK_GROUP_RAID0 = 1 << 3
+BTRFS_BLOCK_GROUP_RAID1 = 1 << 4
+BTRFS_BLOCK_GROUP_DUP = 1 << 5
+BTRFS_BLOCK_GROUP_RAID10 = 1 << 6
+BTRFS_BLOCK_GROUP_RAID5 = 1 << 7
+BTRFS_BLOCK_GROUP_RAID6 = 1 << 8
+
+BTRFS_FIRST_FREE_OBJECTID = 256
+
+ROOT_ITEM_DIRID_OFFSET = 168
+ROOT_ITEM_BYTENR_OFFSET = 176
+ROOT_ITEM_LEVEL_OFFSET = 238
+
+SUPPORTED_SUPERBLOCK_MAGIC = (b"BTRFS\x00\x00", b"BTRFS\x00", b"_BHRfS_M")
+
+
+class BtrfsParseError(RuntimeError):
+    """Raised when the BTRFS reader cannot interpret on-disk data."""
+
+
+@dataclass(slots=True)
+class SuperBlock:
+    """Minimal view of the BTRFS superblock used by the reader."""
+
+    root_logical: int
+    root_level: int
+    chunk_root_logical: int
+    chunk_root_level: int
+    node_size: int
+    sectorsize: int
+    root_dir_objectid: int
+    sys_chunk_array: bytes
+
+
+@dataclass(slots=True)
+class ChunkStripe:
+    devid: int
+    offset: int
+
+
+@dataclass(slots=True)
+class ChunkItem:
+    logical: int
+    length: int
+    chunk_type: int
+    stripes: List[ChunkStripe]
+
+
+@dataclass(slots=True)
+class RootInfo:
+    tree_id: int
+    logical: int
+    level: int
+    root_dirid: int
+
+
+@dataclass(slots=True)
+class InodeRecord:
+    inode_id: int
+    size: int
+    mode: int
+    uid: int
+    gid: int
+    nlink: int
+    rdev: int
+    mtime_ns: int
+    atime_ns: int
+    ctime_ns: int
+
+
+@dataclass(slots=True)
+class DirEntryInfo:
+    name: str
+    inode: int
+    btrfs_type: int
+
+
+@dataclass(slots=True)
+class FileExtent:
+    file_offset: int
+    num_bytes: int
+    disk_bytenr: int
+    disk_num_bytes: int
+    extent_offset: int
+    extent_type: int
+    inline_data: Optional[bytes] = None
+    compression: int = 0
+
+
+@dataclass(slots=True)
+class SubvolumeData:
+    tree_id: int
+    root_dirid: int
+    logical: int
+    level: int
+    inodes: Dict[int, InodeRecord] = field(default_factory=dict)
+    dir_entries: Dict[int, Dict[str, DirEntryInfo]] = field(default_factory=lambda: defaultdict(dict))
+    file_extents: Dict[int, List[FileExtent]] = field(default_factory=lambda: defaultdict(list))
+    unsupported_inodes: set[int] = field(default_factory=set)
+
+
+@dataclass(slots=True)
+class DirEntry:
+    path: str
+    name: str
+    inode: int
+    kind: str
+    size: int
+    mode: int
+    mtime_ns: int
+    target: Optional[str] = None
+
+
+@dataclass(slots=True)
+class FileSegment:
+    start: int
+    length: int
+    logical: int
+    inline_data: Optional[bytes]
+    hole: bool
+
+
+class BtrfsFileHandle(io.RawIOBase):
+    """File-like object that streams data directly from the BTRFS image."""
+
+    def __init__(self, reader: "BtrfsReader", segments: List[FileSegment], size: int) -> None:
+        self._reader = reader
+        self._segments = sorted(segments, key=lambda seg: seg.start)
+        self._size = size
+        self._pos = 0
+        self._segment_index = 0
+
+    def readable(self) -> bool:  # pragma: no cover - RawIOBase API shim
+        return True
+
+    def readinto(self, b: bytearray | memoryview) -> int:  # pragma: no cover - RawIOBase API shim
+        data = self.read(len(b))
+        view = memoryview(b)
+        view[: len(data)] = data
+        return len(data)
+
+    def read(self, size: int = -1) -> bytes:
+        if size is None or size < 0:
+            size = self._size - self._pos
+        if size <= 0 or self._pos >= self._size:
+            return b""
+        size = min(size, self._size - self._pos)
+        chunks: List[bytes] = []
+        remaining = size
+        while remaining > 0:
+            segment = self._current_segment()
+            if segment is None:
+                break
+            offset = self._pos - segment.start
+            take = min(remaining, segment.length - offset)
+            if segment.inline_data is not None:
+                chunk = segment.inline_data[offset : offset + take]
+            elif segment.hole:
+                chunk = bytes(take)
+            else:
+                logical = segment.logical + offset
+                chunk = self._reader._read_logical(logical, take)
+            chunks.append(chunk)
+            self._pos += take
+            remaining -= take
+        return b"".join(chunks)
+
+    def seek(self, offset: int, whence: int = io.SEEK_SET) -> int:  # pragma: no cover - rarely used
+        if whence == io.SEEK_END:
+            offset = self._size + offset
+        elif whence == io.SEEK_CUR:
+            offset = self._pos + offset
+        if offset < 0:
+            raise OSError("negative seek position")
+        self._pos = min(offset, self._size)
+        self._segment_index = 0
+        return self._pos
+
+    def tell(self) -> int:  # pragma: no cover - RawIOBase API shim
+        return self._pos
+
+    def _current_segment(self) -> Optional[FileSegment]:
+        while self._segment_index < len(self._segments):
+            seg = self._segments[self._segment_index]
+            if seg.start <= self._pos < seg.start + seg.length:
+                return seg
+            if self._pos >= seg.start + seg.length:
+                self._segment_index += 1
+            else:
+                break
+        return None
+
+
+class BtrfsReader:
+    """Read-only traversal helper for a single-device BTRFS filesystem."""
+
+    _NODE_HEADER_STRUCT = struct.Struct("<32s16sQQ16sQQIB")
+    _ITEM_STRUCT = struct.Struct("<Q B Q I I")
+    _KEY_POINTER_STRUCT = struct.Struct("<Q B Q Q Q")
+    _DISK_KEY_STRUCT = struct.Struct("<Q B Q")
+    _DIR_ITEM_STRUCT = struct.Struct("<Q B Q Q H H B")
+    _CHUNK_STRUCT = struct.Struct("<Q Q Q Q I I I H H")
+    _STRIPE_STRUCT = struct.Struct("<Q Q 16s")
+
+    def __init__(self, image_path: Path | str, logger: Optional[logging.Logger] = None) -> None:
+        self.image_path = Path(image_path)
+        self._logger = logger or logging.getLogger(self.__class__.__name__)
+        self._file: Optional[BinaryIO] = None
+        self._superblock: Optional[SuperBlock] = None
+        self._chunk_entries: Dict[int, ChunkItem] = {}
+        self._chunk_offsets: List[int] = []
+        self._chunk_list: List[ChunkItem] = []
+        self._root_items: Dict[int, RootInfo] = {}
+        self._subvolumes: Dict[int, SubvolumeData] = {}
+        self._ordered_root_ids: List[int] = []
+        self._fallback_linear = False
+        self._mapping_mode = "chunk"
+        self._image_size = 0
+        self._raw_inodes: Dict[int, InodeRecord] = {}
+        self._raw_dir_entries: Dict[int, List[DirEntryInfo]] = defaultdict(list)
+        self._raw_file_extents: Dict[int, List[FileExtent]] = defaultdict(list)
+        self._raw_unsupported_inodes: set[int] = set()
+        self._raw_parents: Dict[int, set[int]] = defaultdict(set)
+        self._raw_path_by_inode: Dict[int, str] = {}
+        self._raw_inode_by_path: Dict[str, int] = {}
+        self._raw_root_inodes: List[int] = []
+        self._raw_graph_ready = False
+        self._raw_mode = False
+
+    def __enter__(self) -> "BtrfsReader":
+        return self.open()
+
+    def __exit__(self, exc_type, exc, tb) -> None:  # type: ignore[override]
+        self.close()
+
+    def open(self) -> "BtrfsReader":
+        if self._file is None:
+            self._file = self.image_path.open("rb")
+            self._file.seek(0, io.SEEK_END)
+            self._image_size = self._file.tell()
+            self._file.seek(0)
+        if self._superblock is None:
+            self._initialize()
+        return self
+
+    def close(self) -> None:
+        if self._file is not None:
+            self._file.close()
+            self._file = None
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def list_roots(self) -> List[str]:
+        if self._raw_mode:
+            return self._list_raw_roots()
+        subvol = self._get_primary_subvolume()
+        if subvol is not None:
+            entries = subvol.dir_entries.get(subvol.root_dirid, {})
+            names = sorted(name for name in entries if name not in {".", ".."})
+            for entry in names:
+                self._logger.info("Top-level entry discovered: /%s", entry)
+            return [f"/{name}" for name in names]
+        return self._list_raw_roots()
+
+    def _list_raw_roots(self) -> List[str]:
+        self.enable_raw_mode()
+        roots: set[str] = set()
+        for inode_id, path in self._raw_path_by_inode.items():
+            if path in ("/", ""):
+                continue
+            inode = self._raw_inodes.get(inode_id)
+            if inode is None or not stat.S_ISDIR(inode.mode):
+                continue
+            parts = path.strip("/").split("/")
+            if not parts:
+                continue
+            roots.add(f"/{parts[0]}")
+        names = sorted(roots)
+        for entry in names:
+            self._logger.info("Top-level entry discovered via raw scan: %s", entry)
+        return names
+
+    def discover_home_targets(self, home_path: str) -> List[str]:
+        """Return candidate project/Android directories under a given home path."""
+
+        normalized = self._normalize_path(home_path)
+        try:
+            entries = self.list_directory(normalized)
+        except (FileNotFoundError, NotADirectoryError, BtrfsParseError) as exc:
+            self._logger.warning("Unable to inspect %s for target discovery: %s", normalized, exc)
+            return []
+
+        candidates: List[str] = []
+        for name in entries:
+            candidate_path = (
+                normalized if normalized == "/" else normalized.rstrip("/")
+            ) + f"/{name}"
+            try:
+                entry = self.stat_path(candidate_path)
+            except (FileNotFoundError, BtrfsParseError):
+                continue
+            if entry.kind != "dir":
+                continue
+            lower = name.lower()
+            if lower == "projects":
+                candidates.append(candidate_path)
+            elif lower.startswith("android"):
+                candidates.append(candidate_path)
+        for path in candidates:
+            self._logger.info("Discovered candidate target directory: %s", path)
+        return candidates
+
+    def discover_project_targets(self) -> List[str]:
+        """Use the raw graph to find 'projects' and 'Android*' directories."""
+
+        self.enable_raw_mode()
+        targets: set[str] = set()
+        for inode_id, path in self._raw_path_by_inode.items():
+            if not path or path == "/":
+                continue
+            inode = self._raw_inodes.get(inode_id)
+            if inode is None or not stat.S_ISDIR(inode.mode):
+                continue
+            name = path.rstrip("/").split("/")[-1]
+            lower = name.lower()
+            if lower == "projects" or lower.startswith("android"):
+                targets.add(path)
+        for target in sorted(targets):
+            self._logger.info("Raw scan target candidate: %s", target)
+        return sorted(targets)
+
+    def _ensure_raw_graph(self) -> None:
+        if self._raw_graph_ready:
+            return
+        self._logger.info("Scanning BTRFS leaf nodes to rebuild directory graph")
+        self._raw_inodes = {}
+        self._raw_dir_entries = defaultdict(list)
+        self._raw_file_extents = defaultdict(list)
+        self._raw_unsupported_inodes = set()
+        self._raw_parents = defaultdict(set)
+        self._raw_path_by_inode = {}
+        self._raw_inode_by_path = {}
+        self._raw_root_inodes = []
+        self._scan_all_leaf_nodes()
+        self._build_raw_path_index()
+        self._raw_graph_ready = True
+
+    def enable_raw_scan(self) -> None:
+        """Force building the raw graph for fallback operations."""
+
+        self._ensure_raw_graph()
+
+    def enable_raw_mode(self) -> None:
+        """Enable raw-only mode that bypasses metadata trees."""
+
+        if not self._raw_mode:
+            self._logger.info("Enabling raw-only mode (logical == physical)")
+        self._raw_mode = True
+        self._fallback_linear = True
+        self._mapping_mode = "fallback_linear"
+        if self._file is None:
+            return
+        if self._superblock is None:
+            data = self._read_physical(SUPERBLOCK_OFFSET, SUPERBLOCK_SIZE)
+            try:
+                self._superblock = self._parse_superblock(data)
+            except BtrfsParseError as exc:
+                self._logger.warning("Unable to parse superblock in raw mode: %s", exc)
+                self._superblock = SuperBlock(
+                    root_logical=0,
+                    root_level=0,
+                    chunk_root_logical=0,
+                    chunk_root_level=0,
+                    node_size=BLOCK_SIZE,
+                    sectorsize=BLOCK_SIZE,
+                    root_dir_objectid=0,
+                    sys_chunk_array=b"",
+                )
+        self._ensure_raw_graph()
+
+    def resolve_raw_path(self, path: str) -> int:
+        """Resolve a synthetic path to its inode (raw mode)."""
+
+        self._ensure_raw_graph()
+        normalized = self._normalize_path(path)
+        if normalized not in self._raw_inode_by_path:
+            raise FileNotFoundError(path)
+        return self._raw_inode_by_path[normalized]
+
+    def _scan_all_leaf_nodes(self) -> None:
+        total = self._image_size
+        if total <= 0:
+            return
+        for offset in range(0, total, BLOCK_SIZE):
+            if offset + BLOCK_SIZE > total:
+                break
+            try:
+                head = self._read_physical(offset, BLOCK_SIZE)
+            except BtrfsParseError:
+                break
+            try:
+                header = self._parse_node_header(head)
+            except BtrfsParseError:
+                continue
+            if header.level != 0 or header.nritems <= 0:
+                continue
+            if self._fallback_linear and header.bytenr != offset:
+                continue
+            node_data = head
+            node_size = self._superblock.node_size if self._superblock else BLOCK_SIZE
+            max_items = (node_size - self._NODE_HEADER_STRUCT.size) // self._ITEM_STRUCT.size
+            if header.nritems > max_items:
+                continue
+            if node_size > BLOCK_SIZE:
+                if offset + node_size > total:
+                    continue
+                try:
+                    tail = self._read_physical(offset + BLOCK_SIZE, node_size - BLOCK_SIZE)
+                except BtrfsParseError:
+                    continue
+                node_data += tail
+            try:
+                self._scan_leaf_items(offset, node_data, header)
+            except BtrfsParseError as exc:
+                self._logger.debug("Skipping leaf at 0x%x: %s", offset, exc)
+                continue
+
+    def _scan_leaf_items(self, offset: int, node: bytes, header: "_NodeHeader") -> None:
+        total = len(node)
+        for item in self._iter_leaf_items(node, header.nritems):
+            end = item.data_offset + item.data_size
+            if end > total:
+                raise BtrfsParseError("Leaf item exceeds node boundary")
+            payload = node[item.data_offset:end]
+            if item.key_type == BTRFS_INODE_ITEM_KEY:
+                try:
+                    inode = self._parse_inode(item.objectid, payload)
+                except BtrfsParseError:
+                    continue
+                self._raw_inodes[item.objectid] = inode
+            elif item.key_type in (BTRFS_DIR_ITEM_KEY, BTRFS_DIR_INDEX_KEY):
+                entries = self._parse_dir_items(payload)
+                if not entries:
+                    continue
+                bucket = self._raw_dir_entries[item.objectid]
+                for entry in entries:
+                    if entry.name in {".", ".."}:
+                        continue
+                    bucket.append(entry)
+                    self._raw_parents[entry.inode].add(item.objectid)
+            elif item.key_type == BTRFS_EXTENT_DATA_KEY:
+                extent = self._parse_extent(item.offset, payload)
+                if extent is None:
+                    self._raw_unsupported_inodes.add(item.objectid)
+                    continue
+                self._raw_file_extents[item.objectid].append(extent)
+
+    def _build_raw_path_index(self) -> None:
+        sb_root = self._superblock.root_dir_objectid if self._superblock else None
+        roots = self._find_raw_root_inodes()
+        if sb_root and sb_root not in roots and sb_root in self._raw_dir_entries:
+            roots.insert(0, sb_root)
+        if not roots and sb_root:
+            roots = [sb_root]
+        if not roots and self._raw_dir_entries:
+            roots = [next(iter(self._raw_dir_entries.keys()))]
+        self._raw_root_inodes = roots or []
+        seen: set[int] = set()
+        for index, root in enumerate(self._raw_root_inodes):
+            base = "/"
+            if sb_root is None or root != sb_root:
+                base = f"/root_{root}"
+            queue: deque[tuple[int, str]] = deque([(root, base)])
+            while queue:
+                inode_id, path = queue.popleft()
+                if inode_id in seen:
+                    continue
+                seen.add(inode_id)
+                normalized = self._normalize_rebuilt_path(path)
+                self._raw_path_by_inode[inode_id] = normalized
+                self._raw_inode_by_path[normalized] = inode_id
+                entries = self._raw_dir_entries.get(inode_id, [])
+                for info in sorted(entries, key=lambda item: item.name):
+                    child_path = self._join_path(normalized, info.name)
+                    child_path = self._normalize_rebuilt_path(child_path)
+                    if info.inode not in self._raw_path_by_inode:
+                        self._raw_path_by_inode[info.inode] = child_path
+                        self._raw_inode_by_path[child_path] = info.inode
+                    inode = self._raw_inodes.get(info.inode)
+                    if inode and stat.S_ISDIR(inode.mode):
+                        queue.append((info.inode, child_path))
+
+    def _find_raw_root_inodes(self) -> List[int]:
+        parents = set(self._raw_dir_entries.keys())
+        children: set[int] = set()
+        for bucket in self._raw_dir_entries.values():
+            for entry in bucket:
+                children.add(entry.inode)
+        roots = [inode for inode in parents if inode not in children]
+        return roots
+
+    def walk(self, root_path: str) -> Iterator[Tuple[str, DirEntry]]:
+        normalized = self._normalize_path(root_path)
+        if self._raw_mode:
+            self.enable_raw_mode()
+            yield from self._walk_raw(normalized)
+            return
+        try:
+            subvol, inode = self._resolve_path(normalized)
+            yield from self._walk_subvolume(subvol, normalized, inode)
+            return
+        except (FileNotFoundError, BtrfsParseError):
+            pass
+        yield from self._walk_raw(normalized)
+
+    def _walk_subvolume(
+        self, subvol: SubvolumeData, root_path: str, inode: int
+    ) -> Iterator[Tuple[str, DirEntry]]:
+        visited_dirs: set[int] = set()
+        stack: List[Tuple[str, int]] = [(root_path, inode)]
+        while stack:
+            path, inode_id = stack.pop()
+            entry = self._build_dir_entry(subvol, path, inode_id)
+            yield path, entry
+            if entry.kind != "dir" or inode_id in visited_dirs:
+                continue
+            visited_dirs.add(inode_id)
+            children = subvol.dir_entries.get(inode_id, {})
+            for name, info in sorted(children.items(), reverse=True):
+                if name in {".", ".."}:
+                    continue
+                next_path = self._join_path(path, info.name)
+                stack.append((next_path, info.inode))
+
+    def _walk_raw(self, root_path: str) -> Iterator[Tuple[str, DirEntry]]:
+        self._ensure_raw_graph()
+        normalized = self._normalize_path(root_path)
+        inode = self._raw_inode_by_path.get(normalized)
+        if inode is None:
+            raise FileNotFoundError(root_path)
+        visited_dirs: set[int] = set()
+        stack: List[Tuple[str, int]] = [(normalized, inode)]
+        while stack:
+            path, inode_id = stack.pop()
+            entry = self._build_dir_entry(None, path, inode_id)
+            yield path, entry
+            if entry.kind != "dir" or inode_id in visited_dirs:
+                continue
+            visited_dirs.add(inode_id)
+            children = self._raw_dir_entries.get(inode_id, [])
+            for info in sorted(children, key=lambda item: item.name, reverse=True):
+                next_path = self._join_path(path, info.name)
+                stack.append((next_path, info.inode))
+
+    def open_file(self, path: str) -> BinaryIO:
+        if self._raw_mode:
+            return self.open_file_raw(path)
+        subvol, inode_id = self._resolve_any_path(path)
+        inode = self._get_inode_record(inode_id, subvol)
+        if inode is None:
+            raise FileNotFoundError(path)
+        if stat.S_ISDIR(inode.mode):
+            raise IsADirectoryError(path)
+        if self._is_inode_unsupported(inode_id, subvol):
+            raise BtrfsParseError(f"File at {path} uses unsupported features")
+        extents = self._get_file_extents(inode_id, subvol)
+        segments = self._build_segments(extents, inode.size)
+        return BtrfsFileHandle(self, segments, inode.size)
+
+    def open_file_raw(self, path: str) -> BinaryIO:
+        """Open a file using the raw graph only."""
+
+        self.enable_raw_mode()
+        inode_id = self.resolve_raw_path(path)
+        inode = self._raw_inodes.get(inode_id)
+        if inode is None:
+            raise FileNotFoundError(path)
+        if stat.S_ISDIR(inode.mode):
+            raise IsADirectoryError(path)
+        if inode_id in self._raw_unsupported_inodes:
+            raise BtrfsParseError(f"File at {path} uses unsupported features")
+        segments = self._build_segments(self._raw_file_extents.get(inode_id, []), inode.size)
+        return BtrfsFileHandle(self, segments, inode.size)
+
+    def guess_crostini_root(self) -> Optional[str]:
+        """Attempt to locate a Crostini rootfs/home directory automatically."""
+
+        candidates = self._scan_lxd_rootfs()
+        for candidate in candidates:
+            home = self._first_user_home(f"{candidate}/home")
+            if home:
+                self._logger.info("Guessed Crostini home at %s", home)
+                return home
+        if candidates:
+            self._logger.info(
+                "Guessed Crostini rootfs at %s (no explicit home directory discovered)",
+                candidates[0],
+            )
+            return candidates[0]
+
+        home = self._first_user_home("/home")
+        if home:
+            self._logger.info("Falling back to /home-based guess: %s", home)
+            return home
+        self._logger.warning("Unable to guess Crostini rootfs/home path")
+        return None
+
+    def list_directory(self, path: str) -> List[str]:
+        if self._raw_mode:
+            self.enable_raw_mode()
+            inode_id = self.resolve_raw_path(path)
+            inode = self._raw_inodes.get(inode_id)
+            if inode is None or not stat.S_ISDIR(inode.mode):
+                raise NotADirectoryError(path)
+            entries_list = self._raw_dir_entries.get(inode_id, [])
+            return sorted(entry.name for entry in entries_list if entry.name not in {".", ".."})
+        subvol, inode_id = self._resolve_any_path(path)
+        inode = self._get_inode_record(inode_id, subvol)
+        if inode is None or not stat.S_ISDIR(inode.mode):
+            raise NotADirectoryError(path)
+        if subvol is not None:
+            entries = subvol.dir_entries.get(inode_id, {})
+            names = entries.keys()
+        else:
+            entries_list = self._raw_dir_entries.get(inode_id, [])
+            names = (entry.name for entry in entries_list)
+        return sorted(name for name in names if name not in {".", ".."})
+
+    def stat_path(self, path: str) -> DirEntry:
+        if self._raw_mode:
+            self.enable_raw_mode()
+            normalized = self._normalize_path(path)
+            inode_id = self.resolve_raw_path(normalized)
+            return self._build_dir_entry(None, normalized, inode_id)
+        subvol, inode_id = self._resolve_any_path(path)
+        return self._build_dir_entry(subvol, self._normalize_path(path), inode_id)
+
+    # ------------------------------------------------------------------
+    # Initialization helpers
+    # ------------------------------------------------------------------
+
+    def _initialize(self) -> None:
+        data = self._read_physical(SUPERBLOCK_OFFSET, SUPERBLOCK_SIZE)
+        if self._raw_mode:
+            if self._superblock is None:
+                self._superblock = self._parse_superblock(data)
+            self._fallback_linear = True
+            self._mapping_mode = "fallback_linear"
+            return
+        self._superblock = self._parse_superblock(data)
+        self._parse_chunk_array(self._superblock.sys_chunk_array)
+        self._refresh_chunk_map()
+        self._maybe_enable_fallback(self._superblock)
+        self._load_chunk_tree()
+        self._refresh_chunk_map()
+        self._maybe_enable_fallback(self._superblock)
+        self._load_root_tree()
+        self._ordered_root_ids = self._prioritize_subvolumes()
+
+    def _parse_superblock(self, data: bytes) -> SuperBlock:
+        magic = data[0x40:0x48]
+        if magic not in SUPPORTED_SUPERBLOCK_MAGIC:
+            raise BtrfsParseError("Not a BTRFS filesystem")
+        root_logical = struct.unpack_from("<Q", data, 0x50)[0]
+        chunk_root_logical = struct.unpack_from("<Q", data, 0x58)[0]
+        root_dir_objectid = struct.unpack_from("<Q", data, 0x80)[0]
+        sectorsize = struct.unpack_from("<I", data, 0x90)[0]
+        node_size = struct.unpack_from("<I", data, 0x94)[0] or BLOCK_SIZE
+        sys_chunk_size = struct.unpack_from("<I", data, 0xA0)[0]
+        chunk_root_level = data[0xA9]
+        root_level = data[0xA8]
+        sys_chunk_array = data[SYS_CHUNK_ARRAY_OFFSET : SYS_CHUNK_ARRAY_OFFSET + sys_chunk_size]
+        return SuperBlock(
+            root_logical=root_logical,
+            root_level=root_level,
+            chunk_root_logical=chunk_root_logical,
+            chunk_root_level=chunk_root_level,
+            node_size=node_size,
+            sectorsize=sectorsize,
+            root_dir_objectid=root_dir_objectid,
+            sys_chunk_array=sys_chunk_array,
+        )
+
+    def _parse_chunk_array(self, payload: bytes) -> None:
+        offset = 0
+        while offset + self._DISK_KEY_STRUCT.size <= len(payload):
+            objectid, key_type, key_offset = self._DISK_KEY_STRUCT.unpack_from(payload, offset)
+            offset += self._DISK_KEY_STRUCT.size
+            if key_type != BTRFS_CHUNK_ITEM_KEY:
+                self._logger.debug("Ignoring non-chunk key type %s in sys chunk array", key_type)
+                break
+            try:
+                chunk, consumed = self._parse_chunk_item(objectid, payload, offset)
+            except BtrfsParseError as exc:
+                self._logger.warning(
+                    "Skipping malformed chunk item at logical 0x%x from sys array: %s",
+                    objectid,
+                    exc,
+                )
+                break
+            self._add_chunk_entry(chunk)
+            offset += consumed
+
+    def _parse_chunk_item(self, logical: int, data: bytes, offset: int) -> Tuple[ChunkItem, int]:
+        base_size = self._CHUNK_STRUCT.size
+        if offset + base_size > len(data):
+            raise BtrfsParseError("Incomplete chunk item")
+        (
+            length,
+            owner,
+            stripe_len,
+            chunk_type,
+            io_align,
+            io_width,
+            sector_size,
+            num_stripes,
+            sub_stripes,
+        ) = self._CHUNK_STRUCT.unpack_from(data, offset)
+        offset += base_size
+        stripes: List[ChunkStripe] = []
+        remaining = len(data) - offset
+        max_stripes = remaining // self._STRIPE_STRUCT.size
+        if max_stripes <= 0:
+            raise BtrfsParseError("Chunk item missing stripe definitions")
+        stripe_count = min(num_stripes, max_stripes)
+        if stripe_count < num_stripes:
+            self._logger.warning(
+                "Chunk item 0x%x truncated: expected %s stripes but only %s present",
+                logical,
+                num_stripes,
+                stripe_count,
+            )
+        for _ in range(stripe_count):
+            devid, stripe_offset, _dev_uuid = self._STRIPE_STRUCT.unpack_from(data, offset)
+            offset += self._STRIPE_STRUCT.size
+            stripes.append(ChunkStripe(devid=devid, offset=stripe_offset))
+        if not stripes:
+            raise BtrfsParseError("Chunk item had no usable stripes")
+        if len(stripes) > 1:
+            self._logger.debug(
+                "Chunk 0x%x has %d stripes (flags=%s); using first stripe for reads",
+                logical,
+                len(stripes),
+                self._describe_chunk_flags(chunk_type),
+            )
+        consumed = base_size + stripe_count * self._STRIPE_STRUCT.size
+        return ChunkItem(logical=logical, length=length, chunk_type=chunk_type, stripes=stripes), consumed
+
+    def _load_chunk_tree(self) -> None:
+        sb = self._require_superblock()
+        for _, node_header, node in self._iter_tree_leaves(sb.chunk_root_logical, sb.chunk_root_level):
+            for item in self._iter_leaf_items(node, node_header.nritems):
+                if item.key_type != BTRFS_CHUNK_ITEM_KEY:
+                    continue
+                payload = node[item.data_offset : item.data_offset + item.data_size]
+                try:
+                    chunk, _consumed_unused = self._parse_chunk_item(item.objectid, payload, 0)
+                except BtrfsParseError as exc:
+                    self._logger.warning(
+                        "Skipping malformed chunk item from chunk tree at logical 0x%x: %s",
+                        item.objectid,
+                        exc,
+                    )
+                    continue
+                self._add_chunk_entry(chunk)
+
+    def _refresh_chunk_map(self) -> None:
+        usable: List[ChunkItem] = []
+        for chunk in sorted(self._chunk_entries.values(), key=lambda entry: entry.logical):
+            if not chunk.stripes:
+                self._logger.warning("Ignoring chunk 0x%x with zero stripes", chunk.logical)
+                continue
+            if usable and chunk.logical < usable[-1].logical + usable[-1].length:
+                self._logger.warning(
+                    "Overlapping chunk ranges: 0x%x overlaps with previous chunk ending at 0x%x",
+                    chunk.logical,
+                    usable[-1].logical + usable[-1].length,
+                )
+            usable.append(chunk)
+        self._chunk_list = usable
+        self._chunk_offsets = [entry.logical for entry in usable]
+        if not usable:
+            self._logger.warning("No usable chunk mappings discovered from metadata")
+
+    def _maybe_enable_fallback(self, sb: SuperBlock) -> None:
+        essential: List[Tuple[str, int]] = [
+            ("filesystem tree root", sb.root_logical),
+        ]
+        if sb.chunk_root_logical:
+            essential.append(("chunk tree root", sb.chunk_root_logical))
+
+        needs_fallback = False
+        for label, logical in essential:
+            if logical == 0:
+                continue
+            if not self._chunk_list:
+                needs_fallback = True
+                self._logger.warning(
+                    "%s pointer 0x%x has no chunk mappings available",
+                    label.capitalize(),
+                    logical,
+                )
+                continue
+            if self._find_chunk(logical) is None:
+                needs_fallback = True
+                self._logger.warning(
+                    "%s pointer 0x%x is not covered by any chunk mapping", label, logical
+                )
+        if needs_fallback:
+            if not self._fallback_linear:
+                self._logger.warning(
+                    "Enabling fallback linear mapping: treating logical addresses as physical offsets"
+                )
+            self._fallback_linear = True
+            self._mapping_mode = "fallback_linear"
+        else:
+            if self._fallback_linear:
+                self._logger.info("Chunk mappings now cover essential roots; returning to chunk mode")
+            self._fallback_linear = False
+            self._mapping_mode = "chunk"
+
+    def _add_chunk_entry(self, chunk: ChunkItem) -> None:
+        existing = self._chunk_entries.get(chunk.logical)
+        if existing is None or existing.length != chunk.length:
+            if not chunk.stripes:
+                self._logger.warning("Refusing to store chunk 0x%x with zero stripes", chunk.logical)
+                return
+            self._chunk_entries[chunk.logical] = chunk
+
+    def _load_root_tree(self) -> None:
+        sb = self._require_superblock()
+        for _, header, node in self._iter_tree_leaves(sb.root_logical, sb.root_level):
+            for item in self._iter_leaf_items(node, header.nritems):
+                if item.key_type != BTRFS_ROOT_ITEM_KEY:
+                    continue
+                payload = node[item.data_offset : item.data_offset + item.data_size]
+                if len(payload) < ROOT_ITEM_LEVEL_OFFSET + 1:
+                    continue
+                root_dirid = struct.unpack_from("<Q", payload, ROOT_ITEM_DIRID_OFFSET)[0]
+                logical = struct.unpack_from("<Q", payload, ROOT_ITEM_BYTENR_OFFSET)[0]
+                level = payload[ROOT_ITEM_LEVEL_OFFSET]
+                self._root_items[item.objectid] = RootInfo(
+                    tree_id=item.objectid,
+                    logical=logical,
+                    level=level,
+                    root_dirid=root_dirid,
+                )
+        if not self._root_items:
+            self._logger.warning("Root tree contained no subvolume roots; raw mode will be required")
+
+    def _prioritize_subvolumes(self) -> List[int]:
+        user_roots = sorted(
+            [root_id for root_id in self._root_items if root_id >= BTRFS_FIRST_FREE_OBJECTID]
+        )
+        system_roots = sorted(
+            [root_id for root_id in self._root_items if root_id < BTRFS_FIRST_FREE_OBJECTID]
+        )
+        return user_roots + system_roots
+
+    # ------------------------------------------------------------------
+    # Path resolution helpers
+    # ------------------------------------------------------------------
+
+    def _get_primary_subvolume(self) -> Optional[SubvolumeData]:
+        for root_id in self._ordered_root_ids:
+            subvol = self._load_subvolume(root_id)
+            if subvol is not None:
+                return subvol
+        return None
+
+    def _resolve_path(self, path: str) -> Tuple[SubvolumeData, int]:
+        normalized = self._normalize_path(path)
+        segments = [segment for segment in normalized.strip("/").split("/") if segment]
+        if not segments:
+            subvol = self._get_primary_subvolume()
+            if subvol is None:
+                raise FileNotFoundError(path)
+            return subvol, subvol.root_dirid
+        for root_id in self._ordered_root_ids:
+            subvol = self._load_subvolume(root_id)
+            if subvol is None:
+                continue
+            inode = subvol.root_dirid
+            success = True
+            for segment in segments:
+                entries = subvol.dir_entries.get(inode)
+                if not entries:
+                    success = False
+                    break
+                entry = entries.get(segment)
+                if entry is None:
+                    success = False
+                    break
+                inode = entry.inode
+            if success:
+                return subvol, inode
+        raise FileNotFoundError(path)
+
+    def _resolve_any_path(self, path: str) -> Tuple[SubvolumeData | None, int]:
+        normalized = self._normalize_path(path)
+        if self._raw_mode:
+            self.enable_raw_mode()
+            inode_id = self._raw_inode_by_path.get(normalized)
+            if inode_id is None:
+                raise FileNotFoundError(path)
+            return None, inode_id
+        try:
+            return self._resolve_path(normalized)
+        except (FileNotFoundError, BtrfsParseError):
+            self._ensure_raw_graph()
+            inode_id = self._raw_inode_by_path.get(normalized)
+            if inode_id is None:
+                raise
+            return None, inode_id
+
+    def _load_subvolume(self, tree_id: int) -> Optional[SubvolumeData]:
+        cached = self._subvolumes.get(tree_id)
+        if cached is not None:
+            return cached
+        root_info = self._root_items.get(tree_id)
+        if root_info is None or root_info.logical == 0:
+            return None
+        subvol = SubvolumeData(
+            tree_id=tree_id,
+            root_dirid=root_info.root_dirid,
+            logical=root_info.logical,
+            level=root_info.level,
+        )
+        for _, header, node in self._iter_tree_leaves(root_info.logical, root_info.level):
+            for item in self._iter_leaf_items(node, header.nritems):
+                payload = node[item.data_offset : item.data_offset + item.data_size]
+                if item.key_type == BTRFS_INODE_ITEM_KEY:
+                    inode = self._parse_inode(item.objectid, payload)
+                    subvol.inodes[item.objectid] = inode
+                elif item.key_type in (BTRFS_DIR_ITEM_KEY, BTRFS_DIR_INDEX_KEY):
+                    for entry in self._parse_dir_items(payload):
+                        subvol.dir_entries[item.objectid][entry.name] = entry
+                elif item.key_type == BTRFS_EXTENT_DATA_KEY:
+                    extent = self._parse_extent(item.offset, payload)
+                    if extent is None:
+                        subvol.unsupported_inodes.add(item.objectid)
+                        continue
+                    subvol.file_extents[item.objectid].append(extent)
+        self._subvolumes[tree_id] = subvol
+        return subvol
+
+    def _parse_inode(self, inode_id: int, data: bytes) -> InodeRecord:
+        if len(data) < 160:
+            raise BtrfsParseError("Corrupt inode record")
+        size = struct.unpack_from("<Q", data, 16)[0]
+        uid = struct.unpack_from("<I", data, 44)[0]
+        gid = struct.unpack_from("<I", data, 48)[0]
+        nlink = struct.unpack_from("<I", data, 40)[0]
+        mode = struct.unpack_from("<I", data, 52)[0]
+        rdev = struct.unpack_from("<Q", data, 56)[0]
+        atime = self._read_timespec(data, 112)
+        ctime = self._read_timespec(data, 124)
+        mtime = self._read_timespec(data, 136)
+        return InodeRecord(
+            inode_id=inode_id,
+            size=size,
+            mode=mode,
+            uid=uid,
+            gid=gid,
+            nlink=nlink,
+            rdev=rdev,
+            mtime_ns=mtime,
+            atime_ns=atime,
+            ctime_ns=ctime,
+        )
+
+    def _parse_dir_items(self, data: bytes) -> List[DirEntryInfo]:
+        if len(data) < self._DIR_ITEM_STRUCT.size:
+            return []
+        location_objectid, location_type, location_offset, transid, data_len, name_len, dir_type = (
+            self._DIR_ITEM_STRUCT.unpack_from(data, 0)
+        )
+        start = self._DIR_ITEM_STRUCT.size
+        name_bytes = data[start : start + name_len]
+        try:
+            name = name_bytes.decode("utf-8", errors="replace")
+        except UnicodeDecodeError:
+            name = name_bytes.decode("utf-8", errors="ignore")
+        return [DirEntryInfo(name=name, inode=location_objectid, btrfs_type=dir_type)]
+
+    def _parse_extent(self, file_offset: int, data: bytes) -> Optional[FileExtent]:
+        if len(data) < 53:
+            return None
+        generation = struct.unpack_from("<Q", data, 0)[0]
+        ram_bytes = struct.unpack_from("<Q", data, 8)[0]
+        compression = data[16]
+        encryption = data[17]
+        other_encoding = struct.unpack_from("<H", data, 18)[0]
+        extent_type = data[20]
+        if compression != 0 or encryption != 0 or other_encoding != 0:
+            return None
+        inline_offset = 21
+        if extent_type == BTRFS_FILE_EXTENT_INLINE:
+            inline_data = data[inline_offset:]
+            return FileExtent(
+                file_offset=file_offset,
+                num_bytes=len(inline_data),
+                disk_bytenr=0,
+                disk_num_bytes=len(inline_data),
+                extent_offset=0,
+                extent_type=extent_type,
+                inline_data=inline_data,
+            )
+        if len(data) < inline_offset + 32:
+            return None
+        disk_bytenr = struct.unpack_from("<Q", data, inline_offset)[0]
+        disk_num_bytes = struct.unpack_from("<Q", data, inline_offset + 8)[0]
+        extent_offset = struct.unpack_from("<Q", data, inline_offset + 16)[0]
+        num_bytes = struct.unpack_from("<Q", data, inline_offset + 24)[0]
+        return FileExtent(
+            file_offset=file_offset,
+            num_bytes=num_bytes,
+            disk_bytenr=disk_bytenr,
+            disk_num_bytes=disk_num_bytes,
+            extent_offset=extent_offset,
+            extent_type=extent_type,
+            inline_data=None,
+        )
+
+    def _build_segments(self, extents: List[FileExtent], file_size: int) -> List[FileSegment]:
+        segments: List[FileSegment] = []
+        expected = 0
+        for extent in sorted(extents, key=lambda ext: ext.file_offset):
+            if extent.file_offset > expected:
+                gap = extent.file_offset - expected
+                segments.append(FileSegment(start=expected, length=gap, logical=0, inline_data=None, hole=True))
+                expected = extent.file_offset
+            if extent.inline_data is not None:
+                data = extent.inline_data[: extent.num_bytes]
+                segments.append(
+                    FileSegment(
+                        start=extent.file_offset,
+                        length=len(data),
+                        logical=0,
+                        inline_data=data,
+                        hole=False,
+                    )
+                )
+            elif extent.extent_type == BTRFS_FILE_EXTENT_PREALLOC or extent.disk_bytenr == 0:
+                segments.append(
+                    FileSegment(
+                        start=extent.file_offset,
+                        length=extent.num_bytes,
+                        logical=0,
+                        inline_data=None,
+                        hole=True,
+                    )
+                )
+            else:
+                logical = extent.disk_bytenr + extent.extent_offset
+                segments.append(
+                    FileSegment(
+                        start=extent.file_offset,
+                        length=extent.num_bytes,
+                        logical=logical,
+                        inline_data=None,
+                        hole=False,
+                    )
+                )
+            expected = extent.file_offset + extent.num_bytes
+        if expected < file_size:
+            segments.append(FileSegment(start=expected, length=file_size - expected, logical=0, inline_data=None, hole=True))
+        return segments
+
+    # ------------------------------------------------------------------
+    # Node parsing helpers
+    # ------------------------------------------------------------------
+
+    @dataclass(slots=True)
+    class _NodeHeader:
+        nritems: int
+        level: int
+
+    @dataclass(slots=True)
+    class _LeafItem:
+        objectid: int
+        key_type: int
+        offset: int
+        data_offset: int
+        data_size: int
+
+    def _iter_tree_leaves(self, logical: int, level: int) -> Iterator[Tuple[int, BtrfsReader._NodeHeader, bytes]]:
+        stack: List[Tuple[int, int]] = [(logical, level)]
+        visited: set[int] = set()
+        sb = self._require_superblock()
+        while stack:
+            node_logical, expected_level = stack.pop()
+            if node_logical in visited:
+                continue
+            visited.add(node_logical)
+            node = self._read_logical(node_logical, sb.node_size)
+            header = self._parse_node_header(node)
+            if header.level > 0:
+                for _objectid, _key_type, blockptr in self._iter_key_pointers(node, header.nritems):
+                    stack.append((blockptr, header.level - 1))
+            else:
+                yield node_logical, header, node
+
+    def _parse_node_header(self, node: bytes) -> "BtrfsReader._NodeHeader":
+        if len(node) < self._NODE_HEADER_STRUCT.size:
+            raise BtrfsParseError("Corrupt tree node")
+        unpacked = self._NODE_HEADER_STRUCT.unpack_from(node, 0)
+        nritems = unpacked[7]
+        level = unpacked[8]
+        return BtrfsReader._NodeHeader(nritems=nritems, level=level)
+
+    def _iter_leaf_items(self, node: bytes, nritems: int) -> Iterable["BtrfsReader._LeafItem"]:
+        base = self._NODE_HEADER_STRUCT.size
+        size = self._ITEM_STRUCT.size
+        total = len(node)
+        for index in range(nritems):
+            start = base + index * size
+            end = start + size
+            if end > total:
+                break
+            objectid, key_type, key_offset, data_offset, data_size = self._ITEM_STRUCT.unpack_from(node, start)
+            yield BtrfsReader._LeafItem(
+                objectid=objectid,
+                key_type=key_type,
+                offset=key_offset,
+                data_offset=data_offset,
+                data_size=data_size,
+            )
+
+    def _iter_key_pointers(self, node: bytes, nritems: int) -> Iterable[Tuple[int, int, int]]:
+        base = self._NODE_HEADER_STRUCT.size
+        size = self._KEY_POINTER_STRUCT.size
+        total = len(node)
+        for index in range(nritems):
+            start = base + index * size
+            end = start + size
+            if end > total:
+                break
+            objectid, key_type, key_offset, blockptr, generation = self._KEY_POINTER_STRUCT.unpack_from(node, start)
+            yield objectid, key_type, blockptr
+
+    # ------------------------------------------------------------------
+    # Low level IO helpers
+    # ------------------------------------------------------------------
+
+    def _read_physical(self, offset: int, size: int) -> bytes:
+        if self._file is None:
+            raise BtrfsParseError("Image file is not open")
+        self._file.seek(offset)
+        data = self._file.read(size)
+        if len(data) != size:
+            raise BtrfsParseError("Unexpected EOF while reading image")
+        return data
+
+    def _read_logical(self, logical: int, length: int) -> bytes:
+        if length <= 0:
+            return b""
+
+        if self._fallback_linear:
+            return self._read_physical(logical, length)
+
+        if not self._chunk_list:
+            raise BtrfsParseError("Chunk map not initialized")
+
+        chunks = bytearray()
+        remaining = length
+        cursor = logical
+        while remaining > 0:
+            entry = self._find_chunk(cursor)
+            if entry is None:
+                raise BtrfsParseError(f"No chunk mapping for logical 0x{cursor:x}")
+            offset = cursor - entry.logical
+            take = min(remaining, entry.length - offset)
+            if not entry.stripes:
+                raise BtrfsParseError(f"Chunk 0x{entry.logical:x} has no stripes defined")
+            stripe = entry.stripes[0]
+            physical = stripe.offset + offset
+            chunks.extend(self._read_physical(physical, take))
+            cursor += take
+            remaining -= take
+        return bytes(chunks)
+
+    def _find_chunk(self, logical: int) -> Optional[ChunkItem]:
+        index = bisect.bisect_right(self._chunk_offsets, logical) - 1
+        if index < 0:
+            return None
+        entry = self._chunk_list[index]
+        if entry.logical <= logical < entry.logical + entry.length:
+            return entry
+        return None
+
+    def _get_inode_record(self, inode_id: int, subvol: SubvolumeData | None) -> InodeRecord | None:
+        if subvol is not None:
+            return subvol.inodes.get(inode_id)
+        return self._raw_inodes.get(inode_id)
+
+    def _get_file_extents(self, inode_id: int, subvol: SubvolumeData | None) -> List[FileExtent]:
+        if subvol is not None:
+            return subvol.file_extents.get(inode_id, [])
+        return self._raw_file_extents.get(inode_id, [])
+
+    def _is_inode_unsupported(self, inode_id: int, subvol: SubvolumeData | None) -> bool:
+        if subvol is not None:
+            return inode_id in subvol.unsupported_inodes
+        return inode_id in self._raw_unsupported_inodes
+
+    def _build_dir_entry(self, subvol: SubvolumeData | None, path: str, inode_id: int) -> DirEntry:
+        inode = self._get_inode_record(inode_id, subvol)
+        if inode is None:
+            raise FileNotFoundError(path)
+        kind = self._kind_from_mode(inode.mode)
+        name = path.rstrip("/")
+        if name:
+            name = name.split("/")[-1]
+        else:
+            name = "/"
+        target = None
+        if kind == "symlink":
+            segments = self._build_segments(self._get_file_extents(inode_id, subvol), inode.size)
+            handle = BtrfsFileHandle(self, segments, inode.size)
+            target = handle.read().decode("utf-8", errors="replace")
+        return DirEntry(
+            path=path,
+            name=name,
+            inode=inode_id,
+            kind=kind,
+            size=inode.size,
+            mode=inode.mode,
+            mtime_ns=inode.mtime_ns,
+            target=target,
+        )
+
+    def _require_superblock(self) -> SuperBlock:
+        if self._superblock is None:
+            raise BtrfsParseError("Superblock not initialized")
+        return self._superblock
+
+    @staticmethod
+    def _normalize_path(path: str) -> str:
+        path = path or "/"
+        if not path.startswith("/"):
+            path = f"/{path}"
+        while "//" in path:
+            path = path.replace("//", "/")
+        if len(path) > 1 and path.endswith("/"):
+            path = path.rstrip("/")
+        return path or "/"
+
+    def _first_user_home(self, home_root: str) -> Optional[str]:
+        try:
+            entries = self.list_directory(home_root)
+        except (FileNotFoundError, NotADirectoryError, BtrfsParseError):
+            return None
+        for name in entries:
+            if name.startswith("."):
+                continue
+            candidate = f"{home_root.rstrip('/')}/{name}"
+            try:
+                entry = self.stat_path(candidate)
+            except (FileNotFoundError, BtrfsParseError):
+                continue
+            if entry.kind == "dir":
+                return candidate
+        return None
+
+    def _scan_lxd_rootfs(self) -> List[str]:
+        roots: List[str] = []
+        try:
+            pool_names = self.list_directory("/lxd/storage-pools")
+        except (FileNotFoundError, NotADirectoryError, BtrfsParseError):
+            return roots
+        for pool in pool_names:
+            base = f"/lxd/storage-pools/{pool}/containers"
+            try:
+                containers = self.list_directory(base)
+            except (FileNotFoundError, NotADirectoryError, BtrfsParseError):
+                continue
+            for container in containers:
+                candidate = f"{base}/{container}/rootfs"
+                if self._path_exists(candidate):
+                    roots.append(candidate)
+        return roots
+
+    def _path_exists(self, path: str) -> bool:
+        try:
+            self.stat_path(path)
+            return True
+        except (FileNotFoundError, BtrfsParseError):
+            return False
+
+    @staticmethod
+    def _read_timespec(data: bytes, offset: int) -> int:
+        seconds = struct.unpack_from("<Q", data, offset)[0]
+        nanoseconds = struct.unpack_from("<I", data, offset + 8)[0]
+        return seconds * 1_000_000_000 + nanoseconds
+
+    @staticmethod
+    def _kind_from_mode(mode: int) -> str:
+        if stat.S_ISDIR(mode):
+            return "dir"
+        if stat.S_ISLNK(mode):
+            return "symlink"
+        if stat.S_ISCHR(mode):
+            return "char"
+        if stat.S_ISBLK(mode):
+            return "block"
+        if stat.S_ISFIFO(mode):
+            return "fifo"
+        if stat.S_ISSOCK(mode):
+            return "socket"
+        return "file"
+
+    def _describe_chunk_flags(self, flags: int) -> str:
+        names = []
+        mapping = [
+            (BTRFS_BLOCK_GROUP_DATA, "DATA"),
+            (BTRFS_BLOCK_GROUP_SYSTEM, "SYSTEM"),
+            (BTRFS_BLOCK_GROUP_METADATA, "METADATA"),
+            (BTRFS_BLOCK_GROUP_RAID0, "RAID0"),
+            (BTRFS_BLOCK_GROUP_RAID1, "RAID1"),
+            (BTRFS_BLOCK_GROUP_DUP, "DUP"),
+            (BTRFS_BLOCK_GROUP_RAID10, "RAID10"),
+            (BTRFS_BLOCK_GROUP_RAID5, "RAID5"),
+            (BTRFS_BLOCK_GROUP_RAID6, "RAID6"),
+        ]
+        for mask, name in mapping:
+            if flags & mask:
+                names.append(name)
+        if not names:
+            return f"0x{flags:x}"
+        return "|".join(names)
+
+    @staticmethod
+    def _join_path(parent: str, name: str) -> str:
+        parent = parent or "/"
+        if parent == "/":
+            return f"/{name}"
+        return f"{parent.rstrip('/')}/{name}"
+
+    @staticmethod
+    def _normalize_rebuilt_path(path: str) -> str:
+        if not path:
+            return "/"
+        path = path.replace("//", "/")
+        if not path.startswith("/"):
+            path = f"/{path}"
+        if len(path) > 1 and path.endswith("/"):
+            path = path.rstrip("/")
+        return path or "/"
