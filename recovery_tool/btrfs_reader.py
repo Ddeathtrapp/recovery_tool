@@ -1,3 +1,28 @@
+# COPILOT: MODIFY THIS FILE DIRECTLY.
+# You must NOT create a new file.
+# Apply ALL of the following changes to THIS file only:
+#
+# 1. Fix undefined variable in _build_raw_path_index():
+#       replace "name" with "info.name".
+#
+# 2. When self._raw_mode is True, override:
+#       - stat_path() (use raw inode/dir data only)
+#       - list_directory() (use raw graph)
+#       - walk() → call _walk_raw()
+#       - open_file() → call open_file_raw()
+#       Do not allow metadata tree codepaths to run.
+#
+# 3. In _resolve_any_path(), when raw_mode is True:
+#       bypass metadata resolution entirely.
+#
+# 4. In enable_raw_mode():
+#       if superblock cannot be parsed, log a warning but continue.
+#
+# 5. Ensure deterministic raw path building.
+#
+# DO NOT create new classes or fake files.
+# DO NOT write examples.
+# MODIFY THIS FILE ONLY.
 """Minimal BTRFS browser used by the Crostini recovery tool."""
 
 from __future__ import annotations
