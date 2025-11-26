@@ -2,7 +2,7 @@
 # You must NOT create a new file.
 # Apply ALL of the following changes to THIS file only:
 #
-# 1. Fix undefined variable in _build_raw_path_index():
+# 1. Fix undefined variable in  build_raw_path_index():
 #       replace "name" with "info.name".
 #
 # 2. When self._raw_mode is True, override:
